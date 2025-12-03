@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Extended Blitz Coaster</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87CEEB; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-weight: bold;
+            pointer-events: none;
+            text-shadow: 1px 1px 3px black;
+            z-index: 10;
+        }
+        #controls-ui {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 10;
+        }
+        button {
+            padding: 12px 24px;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            border: 2px solid white;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            transition: all 0.2s;
+            pointer-events: auto;
+        }
+        button:hover { background: rgba(0,0,0,0.9); transform: scale(1.05); }
+        #debug-stats {
+            position: absolute;
+            top: 60px;
+            left: 20px;
+            color: #FFFF00;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            pointer-events: none;
+            border-radius: 8px;
+            border-left: 4px solid #FFFF00;
+        }
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-family: sans-serif;
+            font-size: 24px;
+            background: rgba(0,0,0,0.8);
+            padding: 30px;
+            border-radius: 15px;
+            text-align: center;
+            z-index: 20;
+        }
+        /* End Screen UI */
+        #end-screen {
+            display: none; 
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7);
+            z-index: 30;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-family: sans-serif;
+        }
+        #end-screen h1 { font-size: 48px; margin-bottom: 20px; text-transform: uppercase; }
+        #restart-btn {
+            padding: 15px 40px;
+            font-size: 24px;
+            background: #FFD700;
+            color: black;
+            border: none;
+        }
+        #restart-btn:hover { background: #ffea70; transform: scale(1.1); }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">Double-Length Blitz Layout<br/>Desktop: Press 'C' to Toggle View</div>
+    <div id="debug-stats">Initializing Simulation...</div>
+    <div id="controls-ui">
+        <button id="view-btn">Toggle View (C)</button>
+    </div>
+    <div id="loading">Calculating Extended Splines...</div>
+
+    <div id="end-screen">
+        <h1>Ride Finished</h1>
+        <button id="restart-btn">RIDE AGAIN</button>
+        <p style="font-size: 14px; margin-top: 20px; color:white;">(In VR: Press Spacebar on keyboard)</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- ENGINEERING CONFIGURATION ---
+        const CONFIG = {
+            gravity: 9.81,
+            mass: 2000,
+            frictionCoefficient: 0.0050, // Slightly reduced for longer layout
+            airResistance: 0.00015,
+            railColor: 0xFFD700,
+            spineColor: 0x333333,
+            tieColor: 0x111111,
+            supportColor: 0x003366,
+            railSpacing: 1.1,
+            railThickness: 0.15,
+            segments: 6000, // Increased for longer track
+            fov: 95
+        };
+
+        // --- GLOBAL STATE ---
+        let scene, camera, renderer, controls;
+        let cartGroup, dolly, speedLineMesh;
+        let curve;
+        let clock = new THREE.Clock();
+        let viewMode = 'ORBIT'; 
+        let trackFrames = [];
+        let rideState = 'RUNNING';
+
+        const _tmpPos = new THREE.Vector3();
+        const _camOffset = new THREE.Vector3(0, 5, 20);
+
+        const physics = {
+            progress: 0, 
+            distance: 0,
+            velocity: 0, 
+            totalEnergy: 0,
+            maxHeight: 0,
+            trackLength: 0
+        };
+
+        // --- EXTENDED TRACK LAYOUT ---
+        // Positive Bank = Left Turn
+        // Negative Bank = Right Turn
+        const TRACK_NODES = [
+            // --- SECTION 1: FIRST HALF ---
+            { pos: [0, 6, 0], bank: 0 }, // Station
+            { pos: [0, 8, -20], bank: 0 },
+            { pos: [0, 55, -80], bank: 0 }, // Lift Peak
+            { pos: [0, 50, -100], bank: 0 },
+            { pos: [10, 35, -120], bank: -45 }, // Drop
+            { pos: [30, 20, -100], bank: -70 },
+            { pos: [40, 5, -60], bank: -45 },
+            { pos: [40, 30, 0], bank: 0 }, // Airtime 1
+            { pos: [40, 5, 60], bank: 0 }, 
+            { pos: [40, 15, 100], bank: 45 }, // Stengel Dive
+            { pos: [70, 35, 120], bank: 100 }, 
+            { pos: [100, 15, 100], bank: 45 }, 
+            { pos: [110, 5, 60], bank: 0 },
+            { pos: [110, 5, 0], bank: -30 }, // S-Curve
+            { pos: [90, 5, -50], bank: 30 },
+            { pos: [70, 5, -80], bank: -40 },
+            { pos: [30, 10, -100], bank: -50 }, // Helix 1
+            { pos: [0, 12, -80], bank: -60 },
+            { pos: [-20, 10, -50], bank: -45 },
+
+            // --- SECTION 2: EXTENSION ---
+            // Transition from Helix to Second Launch
+            { pos: [-30, 8, -20], bank: -20 }, 
+            
+            // LAUNCH 2 ZONE (Straightaway)
+            { pos: [-40, 5, 0], bank: 0 }, 
+            { pos: [-40, 5, 80], bank: 0 }, // Boosts to ~30m/s here
+
+            // The "Top Gun" Stall (Tall twisted hill)
+            { pos: [-40, 55, 130], bank: 45 }, // Climb Left
+            { pos: [-60, 40, 150], bank: 90 }, // 90 degree sideways stall
+            { pos: [-90, 5, 120], bank: 45 },  // Dive
+
+            // High Speed Weave (Far side)
+            { pos: [-100, 5, 80], bank: 0 },
+            { pos: [-120, 15, 40], bank: -45 }, // Bank Right
+            { pos: [-110, 5, 0], bank: 0 },
+
+            // Double Down (Bunny Hops)
+            { pos: [-110, 15, -40], bank: 0 }, // Hop 1
+            { pos: [-110, 10, -70], bank: 0 }, // Hop 2
+            { pos: [-110, 5, -100], bank: 0 }, // Bottom
+
+            // Final Sweeping Turn (Return to Station)
+            { pos: [-100, 10, -140], bank: 30 }, // Wide Left
+            { pos: [-50, 8, -100], bank: 20 },
+            { pos: [-20, 6, -40], bank: 0 },
+
+            // Brake Run & Station
+            { pos: [0, 6, 0], bank: 0 } 
+        ];
+
+        // --- SHADER ASSETS ---
+        const speedLineVertexShader = `
+            uniform float uTime;
+            uniform float uSpeed;
+            varying float vOpacity;
+            void main() {
+                vec3 pos = position;
+                float stretch = max(1.0, uSpeed * 0.15); 
+                if(uSpeed > 5.0) pos.z *= stretch;
+                if(uSpeed > 15.0) {
+                    float jitter = (uSpeed - 15.0) * 0.0008;
+                    pos.x += sin(uTime * 60.0 + pos.z) * jitter;
+                    pos.y += cos(uTime * 50.0 + pos.z) * jitter;
+                }
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+                float zNorm = abs(position.z) / 10.0;
+                vOpacity = 1.0 - smoothstep(0.4, 1.0, zNorm);
+            }
+        `;
+
+        const speedLineFragmentShader = `
+            uniform vec3 uColor;
+            varying float vOpacity;
+            void main() {
+                gl_FragColor = vec4(uColor, vOpacity * 0.3);
+            }
+        `;
+
+        init();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB);
+            scene.fog = new THREE.Fog(0x87CEEB, 20, 800);
+
+            camera = new THREE.PerspectiveCamera(CONFIG.fov, window.innerWidth / window.innerHeight, 0.1, 1500);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            renderer.xr.setReferenceSpaceType('local-floor');
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.BasicShadowMap;
+            
+            document.body.appendChild(renderer.domElement);
+            document.body.appendChild(VRButton.createButton(renderer));
+
+            const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambient);
+            const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+            sun.position.set(-100, 200, -50);
+            sun.castShadow = true;
+            sun.shadow.mapSize.width = 1024;
+            sun.shadow.mapSize.height = 1024;
+            sun.shadow.camera.near = 0.5;
+            sun.shadow.camera.far = 500;
+            sun.shadow.camera.left = -200;
+            sun.shadow.camera.right = 200;
+            sun.shadow.camera.top = 200;
+            sun.shadow.camera.bottom = -200;
+            scene.add(sun);
+
+            createEnvironment();
+            createCart(); // Init Cart BEFORE track physics
+            generateTrackSystem();
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 30, 0);
+            camera.position.set(-80, 60, 80);
+            controls.update();
+
+            document.getElementById('loading').style.display = 'none';
+            renderer.setAnimationLoop(render);
+
+            window.addEventListener('resize', onWindowResize);
+            document.getElementById('view-btn').addEventListener('click', toggleViewMode);
+            window.addEventListener('keydown', (e) => {
+                const key = e.key.toLowerCase();
+                if(key === 'c') toggleViewMode();
+                if(key === ' ' && rideState === 'STOPPED') restartRide();
+            });
+            document.getElementById('restart-btn').addEventListener('click', restartRide);
+        }
+
+        function toggleViewMode() {
+            viewMode = (viewMode === 'ORBIT') ? 'RIDER' : 'ORBIT';
+            document.getElementById('info').innerHTML = `Mode: ${viewMode} VIEW`;
+        }
+
+        function restartRide() {
+            document.getElementById('end-screen').style.display = 'none';
+            physics.distance = 0;
+            physics.progress = 0;
+            physics.velocity = 0;
+            // Initial Launch Energy
+            physics.totalEnergy = (CONFIG.mass * CONFIG.gravity * physics.maxHeight) + (0.5 * CONFIG.mass * 100);
+            
+            if (trackFrames.length > 0 && cartGroup) {
+                const startFrame = trackFrames[0];
+                cartGroup.position.copy(startFrame.pos);
+                cartGroup.quaternion.copy(startFrame.rot);
+            }
+            rideState = 'RUNNING';
+        }
+
+        function generateTrackSystem() {
+            const points = TRACK_NODES.map(n => new THREE.Vector3(...n.pos));
+            curve = new THREE.CatmullRomCurve3(points);
+            curve.closed = true;
+            curve.tension = 0.4; 
+            physics.trackLength = curve.getLength();
+
+            trackFrames = [];
+            const steps = CONFIG.segments;
+            
+            const getBankAngle = (t) => {
+                const total = TRACK_NODES.length;
+                const floatIdx = t * total;
+                const idx1 = Math.floor(floatIdx) % total;
+                const idx2 = (idx1 + 1) % total;
+                const ratio = floatIdx - Math.floor(floatIdx);
+                const ease = ratio < 0.5 ? 4 * ratio * ratio * ratio : 1 - Math.pow(-2 * ratio + 2, 3) / 2;
+                return THREE.MathUtils.lerp(TRACK_NODES[idx1].bank, TRACK_NODES[idx2].bank, ease);
+            };
+
+            for(let i=0; i<=steps; i++) {
+                const t = i/steps;
+                const pos = curve.getPointAt(t);
+                const tangent = curve.getTangentAt(t).normalize();
+                
+                let up = new THREE.Vector3(0, 1, 0);
+                const right = new THREE.Vector3().crossVectors(tangent, up).normalize();
+                if(right.lengthSq() < 0.001) right.set(1, 0, 0); 
+                const orthoUp = new THREE.Vector3().crossVectors(right, tangent).normalize();
+
+                const bankDeg = getBankAngle(t);
+                const bankRad = THREE.MathUtils.degToRad(bankDeg);
+                const qBank = new THREE.Quaternion().setFromAxisAngle(tangent, bankRad);
+                
+                orthoUp.applyQuaternion(qBank);
+                right.applyQuaternion(qBank);
+
+                const rotMat = new THREE.Matrix4().makeBasis(right, orthoUp, tangent.negate()); 
+                const qRot = new THREE.Quaternion().setFromRotationMatrix(rotMat);
+
+                trackFrames.push({ pos: pos, rot: qRot, up: orthoUp, right: right });
+            }
+
+            generateRails();
+            generateSpine();
+            generateTies();
+            generateSupports();
+
+            physics.maxHeight = 60;
+            restartRide();
+        }
+
+        function generateRails() {
+            const geo = new THREE.BufferGeometry();
+            const verts = [];
+            const indices = [];
+            const segments = 5;
+            const radius = CONFIG.railThickness;
+            const offset = CONFIG.railSpacing / 2;
+            const buildRail = (dir) => {
+                const startIdx = verts.length / 3;
+                for(let i=0; i<trackFrames.length; i++) {
+                    const f = trackFrames[i];
+                    const center = f.pos.clone().addScaledVector(f.right, offset * dir);
+                    for(let j=0; j<segments; j++) {
+                        const ang = (j/segments) * Math.PI * 2;
+                        const lx = Math.cos(ang) * radius;
+                        const ly = Math.sin(ang) * radius;
+                        const v = center.clone().addScaledVector(f.right, lx).addScaledVector(f.up, ly);
+                        verts.push(v.x, v.y, v.z);
+                    }
+                }
+                for(let i=0; i<trackFrames.length-1; i++) {
+                    for(let j=0; j<segments; j++) {
+                        const nextJ = (j+1)%segments;
+                        const a = startIdx + i*segments + j;
+                        const b = startIdx + i*segments + nextJ;
+                        const c = startIdx + (i+1)*segments + j;
+                        const d = startIdx + (i+1)*segments + nextJ;
+                        indices.push(a, d, b); indices.push(a, c, d);
+                    }
+                }
+            };
+            buildRail(1); buildRail(-1);
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+            geo.setIndex(indices);
+            geo.computeVertexNormals();
+            const mat = new THREE.MeshStandardMaterial({ color: CONFIG.railColor, roughness: 0.2, metalness: 0.6 });
+            scene.add(new THREE.Mesh(geo, mat));
+        }
+
+        function generateSpine() {
+            const geo = new THREE.BufferGeometry();
+            const verts = [];
+            const indices = [];
+            const segments = 3;
+            const radius = 0.35;
+            const drop = -0.4;
+            for(let i=0; i<trackFrames.length; i++) {
+                const f = trackFrames[i];
+                const center = f.pos.clone().addScaledVector(f.up, drop);
+                for(let j=0; j<segments; j++) {
+                    const ang = (j/segments) * Math.PI * 2 + Math.PI/2;
+                    const lx = Math.cos(ang) * radius;
+                    const ly = Math.sin(ang) * radius;
+                    const v = center.clone().addScaledVector(f.right, lx).addScaledVector(f.up, ly);
+                    verts.push(v.x, v.y, v.z);
+                }
+            }
+            for(let i=0; i<trackFrames.length-1; i++) {
+                for(let j=0; j<segments; j++) {
+                    const nextJ = (j+1)%segments;
+                    const a = i*segments + j;
+                    const b = i*segments + nextJ;
+                    const c = (i+1)*segments + j;
+                    const d = (i+1)*segments + nextJ;
+                    indices.push(a, d, b); indices.push(a, c, d);
+                }
+            }
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+            geo.setIndex(indices);
+            geo.computeVertexNormals();
+            const mat = new THREE.MeshStandardMaterial({ color: CONFIG.spineColor, roughness: 0.5 });
+            scene.add(new THREE.Mesh(geo, mat));
+        }
+
+        function generateTies() {
+            const spacing = 20;
+            const geo = new THREE.BoxGeometry(0.12, 0.4, 0.12);
+            const mat = new THREE.MeshLambertMaterial({ color: CONFIG.tieColor });
+            const mesh = new THREE.InstancedMesh(geo, mat, Math.ceil(trackFrames.length/spacing) * 2);
+            const dummy = new THREE.Object3D();
+            let idx = 0;
+            for(let i=0; i<trackFrames.length; i+=spacing) {
+                const f = trackFrames[i];
+                dummy.position.copy(f.pos).addScaledVector(f.right, -0.4).addScaledVector(f.up, -0.2);
+                dummy.quaternion.copy(f.rot);
+                dummy.rotateZ(Math.PI/4); dummy.scale.set(1, 1.5, 1); dummy.updateMatrix();
+                mesh.setMatrixAt(idx++, dummy.matrix);
+                dummy.quaternion.copy(f.rot);
+                dummy.rotateZ(-Math.PI/4); dummy.position.copy(f.pos).addScaledVector(f.right, 0.4).addScaledVector(f.up, -0.2);
+                dummy.updateMatrix();
+                mesh.setMatrixAt(idx++, dummy.matrix);
+            }
+            scene.add(mesh);
+        }
+
+        function generateSupports() {
+            const spacing = 130;
+            const geo = new THREE.CylinderGeometry(0.35, 0.5, 1, 6);
+            const mat = new THREE.MeshLambertMaterial({ color: CONFIG.supportColor });
+            const mesh = new THREE.InstancedMesh(geo, mat, Math.ceil(trackFrames.length/spacing));
+            const dummy = new THREE.Object3D();
+            let idx = 0;
+            for(let i=0; i<trackFrames.length; i+=spacing) {
+                const f = trackFrames[i];
+                if(f.pos.y > 4) {
+                    const h = f.pos.y;
+                    dummy.position.set(f.pos.x, h/2, f.pos.z);
+                    dummy.scale.set(1, h, 1);
+                    dummy.rotation.set(0,0,0);
+                    dummy.updateMatrix();
+                    mesh.setMatrixAt(idx++, dummy.matrix);
+                }
+            }
+            scene.add(mesh);
+        }
+
+        function createCart() {
+            cartGroup = new THREE.Group();
+            scene.add(cartGroup);
+            const chassisGeo = new THREE.BoxGeometry(1.4, 0.1, 2.0);
+            const chassisMat = new THREE.MeshPhysicalMaterial({ color: 0x111111, metalness: 0.8, roughness: 0.2 });
+            const chassis = new THREE.Mesh(chassisGeo, chassisMat);
+            chassis.position.y = 0.35; chassis.castShadow = true;
+            cartGroup.add(chassis);
+            const railGeo = new THREE.CylinderGeometry(0.04, 0.04, 1.8);
+            railGeo.rotateX(Math.PI/2);
+            const railLeft = new THREE.Mesh(railGeo, chassisMat); railLeft.position.set(-0.65, 0.6, 0); cartGroup.add(railLeft);
+            const railRight = new THREE.Mesh(railGeo, chassisMat); railRight.position.set(0.65, 0.6, 0); cartGroup.add(railRight);
+            dolly = new THREE.Group();
+            dolly.position.set(0, 1.3, 0.0);
+            cartGroup.add(dolly);
+            const speedGeo = new THREE.CylinderGeometry(3, 3, 20, 16, 1, true);
+            speedGeo.rotateX(-Math.PI/2);
+            const speedMat = new THREE.ShaderMaterial({
+                uniforms: { uTime: { value: 0 }, uSpeed: { value: 0 }, uColor: { value: new THREE.Color(0xFFD700) } },
+                vertexShader: speedLineVertexShader, fragmentShader: speedLineFragmentShader,
+                transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending
+            });
+            speedLineMesh = new THREE.Mesh(speedGeo, speedMat);
+            dolly.add(speedLineMesh);
+            speedLineMesh.visible = false;
+        }
+
+        function createEnvironment() {
+            const planeGeo = new THREE.PlaneGeometry(2000, 2000);
+            const planeMat = new THREE.MeshStandardMaterial({ color: 0x228B22, roughness: 1.0 });
+            const plane = new THREE.Mesh(planeGeo, planeMat);
+            plane.rotation.x = -Math.PI/2; plane.receiveShadow = true;
+            scene.add(plane);
+            const treeGeo = new THREE.ConeGeometry(5, 14, 5);
+            const treeMat = new THREE.MeshLambertMaterial({ color: 0x004400 });
+            const mesh = new THREE.InstancedMesh(treeGeo, treeMat, 800);
+            const dummy = new THREE.Object3D();
+            let count = 0;
+            for(let i=0; i<3000; i++) {
+                if(count >= 800) break;
+                const x = (Math.random()-0.5)*1200;
+                const z = (Math.random()-0.5)*1200;
+                let safe = true;
+                for(let n of TRACK_NODES) {
+                    const dx = n.pos[0] - x;
+                    const dz = n.pos[2] - z;
+                    if(dx*dx + dz*dz < 400) { safe = false; break; }
+                }
+                if(safe) {
+                    dummy.position.set(x, 7, z);
+                    dummy.scale.setScalar(0.8 + Math.random()*0.5);
+                    dummy.updateMatrix();
+                    mesh.setMatrixAt(count++, dummy.matrix);
+                }
+            }
+            scene.add(mesh);
+        }
+
+        function updatePhysics(dt) {
+            if (rideState === 'STOPPED') return;
+
+            const currentH = cartGroup.position.y;
+            const pe = CONFIG.mass * CONFIG.gravity * currentH;
+            let ke = physics.totalEnergy - pe;
+
+            physics.totalEnergy -= CONFIG.frictionCoefficient * physics.velocity * 60 * dt;
+            physics.totalEnergy -= CONFIG.airResistance * physics.velocity * physics.velocity * dt;
+
+            // --- LIFT 1 (Start) ---
+            if(physics.progress < 0.15 && currentH > 10 && currentH < 52) {
+                if(physics.velocity < 9.0) {
+                    ke = 0.5 * CONFIG.mass * (9.0*9.0); 
+                    physics.totalEnergy = ke + pe;
+                }
+            }
+
+            // --- LAUNCH 2 (Extended Section) ---
+            // Rough progress check for the second straightaway
+            // Based on node count, it's roughly 50-55% through track
+            if(physics.progress > 0.45 && physics.progress < 0.55 && currentH < 10) {
+                // Check if we are in the launch corridor (X approx -40, Z between 0 and 80)
+                const pos = cartGroup.position;
+                if(pos.x < -30 && pos.x > -50 && pos.z > -10 && pos.z < 90) {
+                     // BOOST! Target 30m/s (~110 km/h)
+                     const targetKE = 0.5 * CONFIG.mass * (30*30);
+                     if(ke < targetKE) {
+                         ke += (targetKE - ke) * 2.0 * dt; // Rapid acceleration
+                         physics.totalEnergy = ke + pe;
+                     }
+                }
+            }
+            
+            if(ke < 100) ke = 100;
+            physics.velocity = Math.sqrt(2 * ke / CONFIG.mass);
+            
+            let newDistance = physics.distance + physics.velocity * dt;
+
+            if (newDistance >= physics.trackLength) {
+                rideState = 'STOPPED';
+                physics.distance = 0; physics.progress = 0; physics.velocity = 0;
+                document.getElementById('end-screen').style.display = 'flex';
+                if(speedLineMesh) speedLineMesh.visible = false;
+            } else {
+                physics.distance = newDistance;
+                physics.progress = (physics.distance % physics.trackLength) / physics.trackLength;
+            }
+
+            const rawIdx = physics.progress * (trackFrames.length - 1);
+            const currentIdx = Math.floor(rawIdx);
+            const nextIdx = (currentIdx + 1) % trackFrames.length;
+            const alpha = rawIdx - currentIdx; 
+            const currentFrame = trackFrames[currentIdx];
+            const nextFrame = trackFrames[nextIdx];
+            cartGroup.position.lerpVectors(currentFrame.pos, nextFrame.pos, alpha);
+            cartGroup.quaternion.slerpQuaternions(currentFrame.rot, nextFrame.rot, alpha);
+
+            if(speedLineMesh && rideState === 'RUNNING') {
+                speedLineMesh.visible = true;
+                speedLineMesh.material.uniforms.uTime.value += dt;
+                speedLineMesh.material.uniforms.uSpeed.value = physics.velocity;
+            }
+
+            const kph = (physics.velocity * 3.6).toFixed(0);
+            document.getElementById('debug-stats').innerHTML = `VELOCITY: ${kph} km/h<br>ALTITUDE: ${currentH.toFixed(1)} m`;
+        }
+
+        function render() {
+            const dt = clock.getDelta();
+            updatePhysics(dt);
+            const isVR = renderer.xr.isPresenting;
+            const effectiveMode = isVR ? 'RIDER' : viewMode;
+
+            if (effectiveMode === 'RIDER') {
+                if(speedLineMesh) speedLineMesh.visible = (rideState === 'RUNNING');
+                if (camera.parent !== dolly) {
+                    dolly.add(camera); camera.position.set(0, 0, 0); camera.rotation.set(0, 0, 0); controls.enabled = false;
+                }
+            } else {
+                if(speedLineMesh) speedLineMesh.visible = false;
+                if (camera.parent !== scene) {
+                    scene.add(camera);
+                    _tmpPos.copy(_camOffset).applyQuaternion(cartGroup.quaternion);
+                    camera.position.copy(cartGroup.position).add(_tmpPos);
+                    camera.lookAt(cartGroup.position);
+                    controls.enabled = true;
+                }
+                controls.target.copy(cartGroup.position); controls.update();
+            }
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
