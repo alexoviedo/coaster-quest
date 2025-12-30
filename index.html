@@ -147,7 +147,33 @@
       fog: { color: 0xbfd3e8, density: 0.00062 },
       background: { width: 2048, height: 1024 },
       textureAnisoCapDesktop: 8,
-      textureAnisoCapXR: 4
+      textureAnisoCapXR: 4,
+
+      snow: {
+        enabled: true,
+        // Two layers: 1) speed streaks (near) 2) gentle snowfall (far)
+        nearCount: 1200,     // keep modest for Quest
+        farCount: 800,
+        nearBox: { w: 16, h: 8, d: 22 },     // volume around sled (streaks)
+        farBox:  { w: 120, h: 55, d: 120 },  // ambiance around sled
+
+        // Motion
+        nearBaseSpeed: 6.0,          // m/s streaming past you at low speed
+        nearSpeedFactor: 0.42,       // scales with sled velocity
+        nearDown: 0.6,               // subtle downward component
+        farDown: 0.45,
+        farWind: 0.25,
+
+        // Rendering / overdraw
+        nearSizeDesktop: 0.095,
+        nearSizeXR: 0.075,
+        farSizeDesktop: 0.12,
+        farSizeXR: 0.095,
+        nearOpacityDesktop: 0.58,
+        nearOpacityXR: 0.42,
+        farOpacityDesktop: 0.22,
+        farOpacityXR: 0.18
+      }
     };
 
     // CC0 HDRI (Poly Haven) 1K for reflections only
@@ -167,8 +193,18 @@
     let trackGrid = new Map();
     let maxAniso = 4;
 
-    // keep refs so we can (optionally) tweak later
+    // Venue
     let venueGroup = new THREE.Group();
+
+    // Snow FX
+    let snowGroup = new THREE.Group();
+    let snowNear, snowFar;
+    let snowNearMat, snowFarMat;
+    let snowNearPos, snowFarPos; // Float32Array backing
+    let snowNearGeo, snowFarGeo;
+
+    // Snow berms
+    let bermMat;
 
     let state = {
       active: false,
@@ -256,10 +292,10 @@
       generateAdaptiveTerrain();
       upgradeTerrainMaterial();
 
-      // Ice track visuals (geometry unchanged; material upgraded only + AAA sparkle pass)
+      // Ice track visuals (geometry unchanged; material upgraded only + sparkle)
       generateIceChute();
 
-      // Venue dressing (replaced buggy signage/boards system with robust placer)
+      // Venue dressing (robust boards/signage + towers)
       createVenueDressingRobust();
 
       // Scenery
@@ -267,6 +303,9 @@
 
       // Bobsled
       createBobsledUpgraded();
+
+      // Snow FX (new)
+      if (VISUAL.snow.enabled) createSnowFX();
 
       // Controls (drone camera)
       controls = new OrbitControls(camera, renderer.domElement);
@@ -298,6 +337,7 @@
       if (isXR) {
         maxAniso = Math.min(VISUAL.textureAnisoCapXR, renderer.capabilities.getMaxAnisotropy());
 
+        // Big win on Quest
         renderer.shadowMap.enabled = false;
         sunLight.castShadow = false;
 
@@ -308,6 +348,16 @@
 
         if (iceMaterial) iceMaterial.envMapIntensity = 0.62;
         renderer.toneMappingExposure = 0.98;
+
+        // Snow: reduce overdraw (size/opacity) in XR
+        if (snowNearMat) {
+          snowNearMat.size = VISUAL.snow.nearSizeXR;
+          snowNearMat.opacity = VISUAL.snow.nearOpacityXR;
+        }
+        if (snowFarMat) {
+          snowFarMat.size = VISUAL.snow.farSizeXR;
+          snowFarMat.opacity = VISUAL.snow.farOpacityXR;
+        }
       } else {
         maxAniso = Math.min(VISUAL.textureAnisoCapDesktop, renderer.capabilities.getMaxAnisotropy());
 
@@ -316,6 +366,15 @@
 
         if (iceMaterial) iceMaterial.envMapIntensity = 0.9;
         renderer.toneMappingExposure = 1.02;
+
+        if (snowNearMat) {
+          snowNearMat.size = VISUAL.snow.nearSizeDesktop;
+          snowNearMat.opacity = VISUAL.snow.nearOpacityDesktop;
+        }
+        if (snowFarMat) {
+          snowFarMat.size = VISUAL.snow.farSizeDesktop;
+          snowFarMat.opacity = VISUAL.snow.farOpacityDesktop;
+        }
       }
 
       // Update anisotropy
@@ -709,7 +768,7 @@
     }
 
     // ----------------------------
-    // TERRAIN (geometry unchanged; material upgraded)
+    // TERRAIN (geometry unchanged; material upgraded; snow accumulation enhanced)
     // ----------------------------
     function generateAdaptiveTerrain() {
       const size = CONFIG.terrainSize;
@@ -742,11 +801,26 @@
 
         const slope = 1 - THREE.MathUtils.clamp(ny, 0, 1);
 
-        const snowH = smoothstep(115, 165, v.y);
-        const snowSlopeMask = 1 - smoothstep(0.45, 0.85, slope);
-        let snowAmt = THREE.MathUtils.clamp(snowH * (0.55 + 0.45 * snowSlopeMask), 0, 1);
+        // Enhanced snow accumulation (still cheap):
+        // - More snow at altitude
+        // - More snow on flatter surfaces
+        // - Add wind-drift variation via noise
+        const snowH = smoothstep(92, 150, v.y); // lower threshold than before
+        const snowSlopeMask = 1 - smoothstep(0.40, 0.88, slope); // favor flats
+        const drift = (noise2(v.x * 0.06, v.z * 0.06) * 0.5 + 0.5) * 0.55;
 
-        let rockAmt = smoothstep(0.35, 0.85, slope) * (1 - snowAmt);
+        let snowAmt = THREE.MathUtils.clamp((snowH * (0.62 + 0.38 * snowSlopeMask)) * (0.65 + drift), 0, 1);
+
+        // Slightly increase snow near the course corridor to feel “plowed edges”
+        const nearest = nearestTrackInfoXZ(v.x, v.z);
+        if (nearest) {
+          const corridor = smoothstep(CONFIG.bedWidth + 6.0, CONFIG.bedWidth + 18.0, nearest.dist);
+          // corridor = 0 close to track, 1 far away; invert for near boost
+          const nearBoost = (1 - corridor) * 0.22;
+          snowAmt = THREE.MathUtils.clamp(snowAmt + nearBoost, 0, 1);
+        }
+
+        let rockAmt = smoothstep(0.33, 0.86, slope) * (1 - snowAmt);
         rockAmt = THREE.MathUtils.clamp(rockAmt, 0, 1);
 
         const grassAmt = THREE.MathUtils.clamp(1 - rockAmt - snowAmt, 0, 1);
@@ -868,7 +942,7 @@
     }
 
     // ----------------------------
-    // ICE MAPS (procedural + AAA sparkle pass)
+    // ICE MAPS (procedural + sparkle)
     // ----------------------------
     function generateIceMaps() {
       const size = 384;
@@ -918,25 +992,21 @@
       normalTex.repeat.set(8, 16);
       normalTex.anisotropy = maxAniso;
 
-      // AAA pop: micro-sparkle clearcoat roughness map (cheap: 256 canvas)
+      // Sparkle clearcoat roughness map (cheap: 256 canvas)
       const sparkleSize = 256;
       const sc = document.createElement('canvas');
       sc.width = sc.height = sparkleSize;
       const sctx = sc.getContext('2d', { willReadFrequently: true });
 
-      // base clearcoat roughness (mid)
       sctx.fillStyle = 'rgb(170,170,170)'; // ~0.67
       sctx.fillRect(0, 0, sparkleSize, sparkleSize);
 
-      // sparse low-roughness flecks
-      sctx.globalCompositeOperation = 'source-over';
       for (let i = 0; i < 950; i++) {
         const x = Math.random() * sparkleSize;
         const y = Math.random() * sparkleSize;
         const r = 0.8 + Math.random() * 2.2;
         const g = sctx.createRadialGradient(x, y, 0, x, y, r * 3.0);
-        // center goes very low roughness (dark)
-        const center = 10 + Math.floor(Math.random() * 30); // ~0.04..0.16
+        const center = 10 + Math.floor(Math.random() * 30);
         g.addColorStop(0.0, `rgba(${center},${center},${center},0.9)`);
         g.addColorStop(0.25, `rgba(60,60,60,0.35)`);
         g.addColorStop(1.0, `rgba(170,170,170,0.0)`);
@@ -946,7 +1016,6 @@
         sctx.fill();
       }
 
-      // subtle directional "polish" bands (very faint)
       sctx.globalAlpha = 0.10;
       sctx.fillStyle = 'rgb(150,150,150)';
       for (let i = 0; i < 32; i++) {
@@ -1011,6 +1080,7 @@
 
         p.copy(f.pos);
         if (options.downOffset) p.addScaledVector(f.up, -options.downOffset);
+        if (options.upOffset) p.addScaledVector(f.up, options.upOffset);
 
         right.copy(f.right);
         up.copy(f.up);
@@ -1062,8 +1132,8 @@
         roughness: 0.18,
         metalness: 0.0,
         clearcoat: 1.0,
-        clearcoatRoughness: 0.24,             // base
-        clearcoatRoughnessMap: clearcoatRoughnessMap, // AAA sparkle glints
+        clearcoatRoughness: 0.24,
+        clearcoatRoughnessMap: clearcoatRoughnessMap,
         ior: 1.31,
         specularIntensity: 1.0,
         envMapIntensity: 0.9,
@@ -1085,6 +1155,9 @@
 
       if (CONFIG.markings.enabled) generateMarkings();
       generateChuteSupports();
+
+      // New: snow accumulation berms on lips (cheap ribbon meshes)
+      generateTrackSnowBerms();
     }
 
     function generateMarkings() {
@@ -1185,8 +1258,105 @@
       scene.add(supportMesh);
     }
 
+    // New: Snow berm caps along track lips (two ribbons)
+    function generateTrackSnowBerms() {
+      const W = CONFIG.chute.innerHalfWidth;
+      const H = CONFIG.chute.wallHeight;
+      const LO = CONFIG.chute.lipOut;
+      const LU = CONFIG.chute.lipUp;
+
+      // small ribbon thickness across the lip top
+      const lipInset = 0.10;
+      const lipWidth = 0.42;
+
+      // left lip ribbon (x spans outward->inward)
+      const leftProfile = [
+        { x: -(W + LO - lipInset), y: H + LU + 0.06 },
+        { x: -(W + LO - lipInset - lipWidth), y: H + LU + 0.02 }
+      ];
+
+      // right lip ribbon
+      const rightProfile = [
+        { x: (W + LO - lipInset), y: H + LU + 0.06 },
+        { x: (W + LO - lipInset - lipWidth), y: H + LU + 0.02 }
+      ];
+
+      // Berm material (subtle normal, matte snow)
+      const { snowNormal, snowRough } = makeSnowSurfaceMaps(256);
+      bermMat = new THREE.MeshStandardMaterial({
+        color: 0xf3f9ff,
+        roughness: 0.78,
+        metalness: 0.0,
+        normalMap: snowNormal,
+        roughnessMap: snowRough
+      });
+      bermMat.normalScale = new THREE.Vector2(0.35, 0.35);
+
+      const leftGeo = buildSweptMesh(leftProfile, {
+        step: CONFIG.chute.trackStep,
+        downOffset: CONFIG.chute.downOffset
+      });
+      const rightGeo = buildSweptMesh(rightProfile, {
+        step: CONFIG.chute.trackStep,
+        downOffset: CONFIG.chute.downOffset
+      });
+
+      const left = new THREE.Mesh(leftGeo, bermMat);
+      const right = new THREE.Mesh(rightGeo, bermMat);
+
+      left.castShadow = false;
+      right.castShadow = false;
+      left.receiveShadow = true;
+      right.receiveShadow = true;
+      left.renderOrder = 1;
+      right.renderOrder = 1;
+
+      scene.add(left, right);
+    }
+
+    function makeSnowSurfaceMaps(size = 256) {
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      const img = ctx.createImageData(size, size);
+      const d = img.data;
+
+      // height-ish noise for normals / roughness
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const nx = x / size;
+          const ny = y / size;
+
+          let v = 0.55 + (noise2(nx * 50, ny * 50) * 0.5 + 0.5) * 0.25;
+          v += (noise2(nx * 160, ny * 160) * 0.5 + 0.5) * 0.10;
+
+          // occasional micro drifts
+          if ((noise2(nx * 12, ny * 12) * 0.5 + 0.5) > 0.88) v += 0.12;
+
+          v = THREE.MathUtils.clamp(v, 0, 1);
+          const c8 = Math.floor(v * 255);
+          const i = (y * size + x) * 4;
+          d[i+0] = c8; d[i+1] = c8; d[i+2] = c8; d[i+3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+
+      const rough = new THREE.CanvasTexture(c);
+      rough.colorSpace = THREE.NoColorSpace;
+      rough.wrapS = rough.wrapT = THREE.RepeatWrapping;
+      rough.repeat.set(6, 10);
+      rough.anisotropy = maxAniso;
+
+      const normal = makeNormalFromHeightCanvas(c, 1.9, size);
+      normal.wrapS = normal.wrapT = THREE.RepeatWrapping;
+      normal.repeat.set(6, 10);
+      normal.anisotropy = maxAniso;
+
+      return { snowNormal: normal, snowRough: rough };
+    }
+
     // ----------------------------
-    // Venue dressing (ROBUST) — fixes buggy boards/signs
+    // Venue dressing (ROBUST) — boards/signs + camera towers
     // ----------------------------
     function createVenueDressingRobust() {
       if (venueGroup) {
@@ -1222,19 +1392,13 @@
         side: THREE.DoubleSide
       });
 
-      // Unit-height poles so scaling in Y gives exact height with grounded base
       const poleGeo = new THREE.CylinderGeometry(0.06, 0.07, 1.0, 10);
       poleGeo.translate(0, 0.5, 0);
       const poleMat = new THREE.MeshStandardMaterial({ color: 0xe9eef7, roughness: 0.65, metalness: 0.0 });
 
-      // Budgets (static, low draw calls)
       const MAX_BOARDS = 820;
       const boards = new THREE.InstancedMesh(boardGeo, boardMat, MAX_BOARDS);
-
-      // 2 poles per board (left+right)
       const poles = new THREE.InstancedMesh(poleGeo, poleMat, MAX_BOARDS * 2);
-
-      // optional nets (1 per board)
       const nets = new THREE.InstancedMesh(netGeo, netMat, MAX_BOARDS);
 
       boards.instanceMatrix.setUsage(THREE.StaticDrawUsage);
@@ -1247,14 +1411,13 @@
       let p = 0;
       let n = 0;
 
-      // Placement policy: farther from chute + skip steep/curvy zones
-      const baseOffset = CONFIG.chute.innerHalfWidth + 9.2; // farther than before
+      const baseOffset = CONFIG.chute.innerHalfWidth + 9.2;
       const netOut = 0.75;
-      const boardClearance = 0.10; // lift above max ground in footprint
-      const boardHalfW = 3.0;      // along board width
-      const boardHalfD = 0.5;      // along board depth footprint sample
-      const maxFootprintDeltaY = 0.85; // skip if ground varies too much under sign
-      const step = 62;             // spacing along track
+      const boardClearance = 0.10;
+      const boardHalfW = 3.0;
+      const boardHalfD = 0.5;
+      const maxFootprintDeltaY = 0.85;
+      const step = 62;
 
       for (let i = 120; i < trackFrames.length - 120; i += step) {
         const f = trackFrames[i];
@@ -1262,57 +1425,46 @@
         const forward = getForwardXZ(i);
         if (forward.lengthSq() < 1e-6) continue;
 
-        // curvature proxy: angle between forward at i-10 and i+10
         const curv = curvatureProxy(i, 14);
-        if (curv > 0.32) continue; // skip very tight sections (avoids awkward angles)
+        if (curv > 0.32) continue;
 
-        // slight offset farther out on higher curvature to avoid clipping and odd sightlines
         const extra = THREE.MathUtils.clamp(curv * 6.0, 0, 2.3);
         const offset = baseOffset + extra;
 
-        // left and right
         placeBoardSide(-1);
         placeBoardSide(+1);
 
         function placeBoardSide(side) {
           if (b >= MAX_BOARDS || p + 2 > MAX_BOARDS * 2 || n >= MAX_BOARDS) return;
 
-          // right vector in XZ plane based on forward
           const rightXZ = new THREE.Vector3(forward.z, 0, -forward.x).normalize();
 
           const pos = f.pos.clone().addScaledVector(rightXZ, offset * side);
 
-          // Face inward (toward track)
           const inward = rightXZ.clone().multiplyScalar(-side);
           const yaw = Math.atan2(inward.x, inward.z);
 
-          // Sample ground under board footprint (center + 4 corners in yaw space)
           const fp = sampleFootprint(pos.x, pos.z, yaw, boardHalfW, boardHalfD);
           if (!fp) return;
           if ((fp.maxY - fp.minY) > maxFootprintDeltaY) return;
 
-          const boardY = fp.maxY + boardClearance + 0.56; // 1.12/2
+          const boardY = fp.maxY + boardClearance + 0.56;
 
-          // Keep boards from getting visually too close vertically to chute in deep valleys:
-          // if terrain is close to track height (banked wall), push outward slightly by skipping
           const nearest = nearestTrackInfoXZ(pos.x, pos.z);
           if (nearest && nearest.dist < (offset - 0.9)) return;
 
-          // Board instance
           dummy.position.set(pos.x, boardY, pos.z);
           dummy.rotation.set(0, yaw, 0);
           dummy.scale.set(1, 1, 1);
           dummy.updateMatrix();
           boards.setMatrixAt(b, dummy.matrix);
 
-          // Net instance behind board (outward)
           const outward = inward.clone().multiplyScalar(-1);
           dummy.position.set(pos.x + outward.x * netOut, boardY + 0.22, pos.z + outward.z * netOut);
           dummy.rotation.set(0, yaw, 0);
           dummy.updateMatrix();
           nets.setMatrixAt(n, dummy.matrix);
 
-          // Poles: under board ends, connect exactly to board bottom
           const boardBottomY = boardY - 0.56;
           const xAxis = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
           const endOff = boardHalfW - 0.45;
@@ -1323,18 +1475,15 @@
           const gA = getTerrainHeightAt(polePosA.x, polePosA.z);
           const gB = getTerrainHeightAt(polePosB.x, polePosB.z);
 
-          // clamp: don't let pole height go tiny or absurd
           const hA = THREE.MathUtils.clamp(boardBottomY - gA, 0.55, 3.4);
           const hB = THREE.MathUtils.clamp(boardBottomY - gB, 0.55, 3.4);
 
-          // pole A
-          dummy.position.set(polePosA.x, gA, polePosA.z); // base on ground (geo base at y=0)
+          dummy.position.set(polePosA.x, gA, polePosA.z);
           dummy.rotation.set(0, yaw, 0);
           dummy.scale.set(1, hA, 1);
           dummy.updateMatrix();
           poles.setMatrixAt(p++, dummy.matrix);
 
-          // pole B
           dummy.position.set(polePosB.x, gB, polePosB.z);
           dummy.scale.set(1, hB, 1);
           dummy.updateMatrix();
@@ -1355,13 +1504,14 @@
 
       venueGroup.add(boards, nets, poles);
 
-      // Flags (still cheap) + Distance markers (AAA pop)
       addFlags(venueGroup);
       addDistanceMarkers(venueGroup);
 
+      // New: Camera towers (instanced, low poly)
+      createCameraTowers(venueGroup);
+
       scene.add(venueGroup);
 
-      // Start/finish arch — rebuilt to avoid terrain collision + keep it aligned
       createArchNearStartFinish();
     }
 
@@ -1379,12 +1529,11 @@
       const a = getForwardXZ(i - span);
       const b = getForwardXZ(i + span);
       const dot = THREE.MathUtils.clamp(a.dot(b), -1, 1);
-      const ang = Math.acos(dot); // radians
-      return ang; // bigger = more curved
+      const ang = Math.acos(dot);
+      return ang;
     }
 
     function sampleFootprint(x, z, yaw, halfW, halfD) {
-      // sample center + corners in yaw space
       const cy = getTerrainHeightAt(x, z);
 
       const c = Math.cos(yaw), s = Math.sin(yaw);
@@ -1429,7 +1578,6 @@
       ctx.fillRect(0, h - 16, w, 16);
       ctx.globalAlpha = 1.0;
 
-      // more stable text (no huge repeated long phrase)
       ctx.fillStyle = '#0a1a2f';
       ctx.font = '900 86px system-ui,Segoe UI,Roboto,sans-serif';
       ctx.textBaseline = 'middle';
@@ -1438,7 +1586,6 @@
       ctx.fillText('ICE RUN', w * 0.50, h * 0.53);
       ctx.globalAlpha = 1.0;
 
-      // subtle grunge
       ctx.globalAlpha = 0.10;
       for (let i = 0; i < 1400; i++) {
         const x = Math.random() * w;
@@ -1611,10 +1758,10 @@
       return tex;
     }
 
-    // AAA pop: distance markers along course (small count, safe draw calls)
+    // Distance markers (AAA pop)
     function addDistanceMarkers(parent) {
       const len = trackCurve.getLength();
-      const spacing = 100; // meters
+      const spacing = 100;
       const maxMarkers = Math.floor(len / spacing);
 
       const geo = new THREE.PlaneGeometry(1.25, 0.80);
@@ -1632,10 +1779,7 @@
         const forward = getForwardXZ(idx);
         const rightXZ = new THREE.Vector3(forward.z, 0, -forward.x).normalize();
 
-        // alternate sides
         const side = (k % 2 === 0) ? 1 : -1;
-
-        // put them beyond boards, with safe clearance
         const offset = CONFIG.chute.innerHalfWidth + 14.4;
         const x = f.pos.x + rightXZ.x * offset * side;
         const z = f.pos.z + rightXZ.z * offset * side;
@@ -1665,7 +1809,6 @@
         sign.castShadow = false;
         sign.renderOrder = 3;
 
-        // two small posts
         const postA = new THREE.Mesh(postGeo, postMat);
         const postB = new THREE.Mesh(postGeo, postMat);
 
@@ -1704,29 +1847,24 @@
       c.width = w; c.height = h;
       const ctx = c.getContext('2d');
 
-      // rounded plate with alpha background
       ctx.clearRect(0,0,w,h);
 
-      // plate
       const r = 28;
       ctx.fillStyle = 'rgba(10,20,40,0.92)';
       roundRect(ctx, 24, 26, w - 48, h - 52, r);
       ctx.fill();
 
-      // border
       ctx.lineWidth = 10;
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       roundRect(ctx, 24, 26, w - 48, h - 52, r);
       ctx.stroke();
 
-      // text
       ctx.fillStyle = 'rgba(255,255,255,0.98)';
       ctx.font = '900 112px system-ui,Segoe UI,Roboto,sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(text, w * 0.5, h * 0.52);
 
-      // subtle noise
       ctx.globalAlpha = 0.10;
       for (let i = 0; i < 1800; i++) {
         ctx.fillStyle = `rgba(255,255,255,${Math.random() * 0.14})`;
@@ -1752,9 +1890,157 @@
       ctx.closePath();
     }
 
-    // rebuilt arch placement (fixes “floating / colliding” issues)
+    // New: Camera towers (instanced)
+    function createCameraTowers(parent) {
+      const N = 8;
+
+      const poleGeo = new THREE.CylinderGeometry(0.10, 0.12, 1.0, 10);
+      poleGeo.translate(0, 0.5, 0);
+
+      const platGeo = new THREE.BoxGeometry(1.65, 0.12, 1.15);
+      const railGeo = new THREE.BoxGeometry(1.65, 0.55, 1.15);
+      railGeo.translate(0, 0.28, 0);
+
+      const camBodyGeo = new THREE.BoxGeometry(0.38, 0.18, 0.20);
+      const camLensGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.10, 12);
+      camLensGeo.rotateX(Math.PI/2);
+
+      const metal = new THREE.MeshStandardMaterial({ color: 0xe7eef8, roughness: 0.55, metalness: 0.12 });
+      const dark  = new THREE.MeshStandardMaterial({ color: 0x11151a, roughness: 0.6, metalness: 0.08 });
+
+      const poles = new THREE.InstancedMesh(poleGeo, metal, N);
+      const plats = new THREE.InstancedMesh(platGeo, metal, N);
+      const rails = new THREE.InstancedMesh(railGeo, metal, N);
+      const camBodies = new THREE.InstancedMesh(camBodyGeo, dark, N);
+      const camLens = new THREE.InstancedMesh(camLensGeo, metal, N);
+
+      poles.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      plats.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      rails.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      camBodies.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      camLens.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+
+      const dummy = new THREE.Object3D();
+
+      const indices = pickTowerFrames(N);
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        const f = trackFrames[idx];
+
+        const forward = getForwardXZ(idx);
+        const rightXZ = new THREE.Vector3(forward.z, 0, -forward.x).normalize();
+
+        // put towers farther out + alternate sides
+        const side = (i % 2 === 0) ? 1 : -1;
+        const offset = CONFIG.chute.innerHalfWidth + 22.0 + (Math.random() * 4.0);
+
+        const x = f.pos.x + rightXZ.x * offset * side;
+        const z = f.pos.z + rightXZ.z * offset * side;
+        const g = getTerrainHeightAt(x, z);
+
+        // aim camera at the track
+        const inward = rightXZ.clone().multiplyScalar(-side);
+        const yaw = Math.atan2(inward.x, inward.z);
+
+        // tower height scaled a bit with local altitude
+        const height = THREE.MathUtils.clamp(5.8 + (f.pos.y - 90) * 0.02 + Math.random() * 1.6, 5.4, 9.2);
+
+        // Pole
+        dummy.position.set(x, g, z);
+        dummy.rotation.set(0, yaw, 0);
+        dummy.scale.set(1, height, 1);
+        dummy.updateMatrix();
+        poles.setMatrixAt(i, dummy.matrix);
+
+        // Platform
+        dummy.position.set(x, g + height, z);
+        dummy.rotation.set(0, yaw, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        plats.setMatrixAt(i, dummy.matrix);
+
+        // Rail (cheap solid safety rail)
+        dummy.position.set(x, g + height, z);
+        dummy.rotation.set(0, yaw, 0);
+        dummy.updateMatrix();
+        rails.setMatrixAt(i, dummy.matrix);
+
+        // Camera body (slightly forward)
+        const fx = x + inward.x * 0.55;
+        const fz = z + inward.z * 0.55;
+
+        dummy.position.set(fx, g + height + 0.38, fz);
+        dummy.rotation.set(0, yaw, 0);
+        dummy.updateMatrix();
+        camBodies.setMatrixAt(i, dummy.matrix);
+
+        // Lens
+        dummy.position.set(fx + inward.x * 0.18, g + height + 0.38, fz + inward.z * 0.18);
+        dummy.rotation.set(0, yaw, 0);
+        dummy.updateMatrix();
+        camLens.setMatrixAt(i, dummy.matrix);
+      }
+
+      poles.castShadow = true; poles.receiveShadow = true;
+      plats.castShadow = true; plats.receiveShadow = true;
+      rails.castShadow = true; rails.receiveShadow = true;
+      camBodies.castShadow = true; camBodies.receiveShadow = true;
+      camLens.castShadow = true; camLens.receiveShadow = true;
+
+      parent.add(poles, plats, rails, camBodies, camLens);
+    }
+
+    function pickTowerFrames(n) {
+      // pick scenic-ish frames: avoid extreme curvature, avoid very steep ground changes
+      const picks = [];
+      const start = Math.floor(trackFrames.length * 0.12);
+      const end   = Math.floor(trackFrames.length * 0.92);
+      const stride = Math.floor((end - start) / (n * 3));
+
+      for (let base = start; base < end && picks.length < n; base += stride) {
+        let best = -1;
+        let bestScore = Infinity;
+
+        for (let j = -60; j <= 60; j += 6) {
+          const i = THREE.MathUtils.clamp(base + j, 120, trackFrames.length - 120);
+          const curv = curvatureProxy(i, 18);
+          if (curv > 0.34) continue;
+
+          const f = trackFrames[i];
+          const forward = getForwardXZ(i);
+          const rightXZ = new THREE.Vector3(forward.z, 0, -forward.x).normalize();
+
+          // sample terrain flatness where tower will be
+          const side = (picks.length % 2 === 0) ? 1 : -1;
+          const offset = CONFIG.chute.innerHalfWidth + 24.0;
+
+          const x = f.pos.x + rightXZ.x * offset * side;
+          const z = f.pos.z + rightXZ.z * offset * side;
+
+          const fp = sampleFootprint(x, z, 0, 1.0, 1.0);
+          if (!fp) continue;
+
+          const flat = (fp.maxY - fp.minY);
+          const score = curv * 2.0 + flat * 1.4;
+
+          if (score < bestScore) {
+            bestScore = score;
+            best = i;
+          }
+        }
+
+        if (best !== -1) picks.push(best);
+      }
+
+      // fallback if somehow short
+      while (picks.length < n) picks.push(Math.floor(trackFrames.length * (0.2 + 0.7 * (picks.length / n))));
+      return picks;
+    }
+
+    // ----------------------------
+    // Start/Finish arch (stable placement)
+    // ----------------------------
     function createArchNearStartFinish() {
-      // remove any previous arches in venueGroup
       const toRemove = [];
       venueGroup.traverse((o) => { if (o.userData && o.userData.isArch) toRemove.push(o); });
       toRemove.forEach(o => venueGroup.remove(o));
@@ -1776,7 +2062,6 @@
         const forward = getForwardXZ(i);
         const rightXZ = new THREE.Vector3(forward.z, 0, -forward.x).normalize();
 
-        // sample ground at posts
         const postOffset = CONFIG.chute.innerHalfWidth + 11.2;
         const lx = f.pos.x - rightXZ.x * postOffset;
         const lz = f.pos.z - rightXZ.z * postOffset;
@@ -1786,7 +2071,6 @@
         const gL = getTerrainHeightAt(lx, lz);
         const gR = getTerrainHeightAt(rx, rz);
 
-        // flatness + curvature
         const flat = Math.abs(gL - gR);
         const curv = curvatureProxy(i, 16);
         const score = flat * 1.6 + curv * 2.4;
@@ -1816,7 +2100,6 @@
       const gL = getTerrainHeightAt(lx, lz);
       const gR = getTerrainHeightAt(rx, rz);
 
-      // beam clears chute (use track Y + clearance)
       const beamY = Math.max(f.pos.y + 5.6, gL + 5.2, gR + 5.2);
 
       const leftH = THREE.MathUtils.clamp(beamY - gL, 4.4, 8.0);
@@ -1827,7 +2110,6 @@
 
       const mat = new THREE.MeshStandardMaterial({ color: 0xf7fbff, roughness: 0.62, metalness: 0.0 });
 
-      // unit posts (base at y=0 for easy scaling)
       const postGeo = new THREE.BoxGeometry(0.55, 1.0, 0.55);
       postGeo.translate(0, 0.5, 0);
 
@@ -1848,7 +2130,6 @@
       beam.rotation.set(0, yaw, 0);
       beam.castShadow = true;
 
-      // Sign on beam
       const signTex = makeGateSignTexture(1024, 256, label);
       signTex.colorSpace = THREE.SRGBColorSpace;
       signTex.anisotropy = maxAniso;
@@ -1857,10 +2138,9 @@
       const signGeo = new THREE.PlaneGeometry(4.9, 1.06);
       const sign = new THREE.Mesh(signGeo, signMat);
 
-      // place sign just in front of beam, centered
       const beamForward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
       sign.position.set(f.pos.x + beamForward.x * 0.36, beamY - 0.25, f.pos.z + beamForward.z * 0.36);
-      sign.rotation.set(0, yaw + Math.PI, 0); // face back toward approach
+      sign.rotation.set(0, yaw + Math.PI, 0);
       sign.castShadow = false;
 
       arch.add(postL, postR, beam, sign);
@@ -1905,7 +2185,7 @@
     }
 
     // ----------------------------
-    // Scenery: upgraded PBR trees + snow
+    // Scenery: upgraded PBR trees + snow (unchanged from prior)
     // ----------------------------
     function generateSceneryUpgraded() {
       const foliageGeoFar = new THREE.ConeGeometry(2.6, 10.8, 8);
@@ -2071,7 +2351,7 @@
     }
 
     // ----------------------------
-    // Bobsled (upgraded)
+    // Bobsled (unchanged from prior)
     // ----------------------------
     function createBobsledUpgraded() {
       sled = new THREE.Group();
@@ -2134,7 +2414,7 @@
       bumper.castShadow = true;
       sled.add(bumper);
 
-      const runnerMat = new THREE.MeshStandardMaterial({ color: 0xe9eef7, roughness: 0.18, metalness: 0.85, envMapIntensity: 0.9 });
+      const runnerMat = new THREE.MeshStandardMaterial({ color: 0xe9eef8, roughness: 0.18, metalness: 0.85, envMapIntensity: 0.9 });
       const runnerCurve = new THREE.CatmullRomCurve3([
         new THREE.Vector3(0, 0.0, -0.95),
         new THREE.Vector3(0, 0.0, -0.45),
@@ -2233,6 +2513,289 @@
     }
 
     // ----------------------------
+    // Snow FX (Quest-friendly: 2 Points systems)
+    // ----------------------------
+    function createSnowFX() {
+      if (snowGroup) scene.remove(snowGroup);
+      snowGroup = new THREE.Group();
+      snowGroup.renderOrder = 10;
+
+      const streakTex = makeSnowStreakTexture(128, 256);
+      streakTex.colorSpace = THREE.SRGBColorSpace;
+      streakTex.anisotropy = maxAniso;
+
+      const flakeTex = makeSnowFlakeTexture(128, 128);
+      flakeTex.colorSpace = THREE.SRGBColorSpace;
+      flakeTex.anisotropy = maxAniso;
+
+      // Materials (depthWrite off to reduce popping; alphaTest keeps fillrate sane)
+      snowNearMat = new THREE.PointsMaterial({
+        map: streakTex,
+        transparent: true,
+        opacity: VISUAL.snow.nearOpacityDesktop,
+        size: VISUAL.snow.nearSizeDesktop,
+        sizeAttenuation: true,
+        depthWrite: false,
+        alphaTest: 0.12
+      });
+
+      snowFarMat = new THREE.PointsMaterial({
+        map: flakeTex,
+        transparent: true,
+        opacity: VISUAL.snow.farOpacityDesktop,
+        size: VISUAL.snow.farSizeDesktop,
+        sizeAttenuation: true,
+        depthWrite: false,
+        alphaTest: 0.08
+      });
+
+      // Geometry
+      snowNearGeo = new THREE.BufferGeometry();
+      snowFarGeo = new THREE.BufferGeometry();
+
+      snowNearPos = new Float32Array(VISUAL.snow.nearCount * 3);
+      snowFarPos = new Float32Array(VISUAL.snow.farCount * 3);
+
+      // Seed positions around origin; we’ll relocate around sled on first update
+      for (let i = 0; i < VISUAL.snow.nearCount; i++) {
+        const o = i * 3;
+        snowNearPos[o+0] = (Math.random() - 0.5) * VISUAL.snow.nearBox.w;
+        snowNearPos[o+1] = (Math.random() - 0.2) * VISUAL.snow.nearBox.h;
+        snowNearPos[o+2] = (Math.random() - 0.5) * VISUAL.snow.nearBox.d;
+      }
+      for (let i = 0; i < VISUAL.snow.farCount; i++) {
+        const o = i * 3;
+        snowFarPos[o+0] = (Math.random() - 0.5) * VISUAL.snow.farBox.w;
+        snowFarPos[o+1] = (Math.random() - 0.05) * VISUAL.snow.farBox.h;
+        snowFarPos[o+2] = (Math.random() - 0.5) * VISUAL.snow.farBox.d;
+      }
+
+      snowNearGeo.setAttribute('position', new THREE.BufferAttribute(snowNearPos, 3).setUsage(THREE.DynamicDrawUsage));
+      snowFarGeo.setAttribute('position', new THREE.BufferAttribute(snowFarPos, 3).setUsage(THREE.DynamicDrawUsage));
+
+      snowNear = new THREE.Points(snowNearGeo, snowNearMat);
+      snowFar = new THREE.Points(snowFarGeo, snowFarMat);
+
+      // Put snow in front of other transparent signage
+      snowNear.renderOrder = 10;
+      snowFar.renderOrder = 9;
+
+      snowGroup.add(snowFar, snowNear);
+      scene.add(snowGroup);
+
+      // apply XR defaults if already presenting
+      if (renderer.xr.isPresenting) setXRQuality(true);
+    }
+
+    function makeSnowStreakTexture(w, h) {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+
+      ctx.clearRect(0, 0, w, h);
+
+      // soft elongated streak (center bright)
+      const g = ctx.createRadialGradient(w*0.5, h*0.25, 0, w*0.5, h*0.55, h*0.65);
+      g.addColorStop(0.0, 'rgba(255,255,255,0.95)');
+      g.addColorStop(0.18, 'rgba(255,255,255,0.40)');
+      g.addColorStop(1.0, 'rgba(255,255,255,0.0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, h);
+
+      // faint vertical core to read as motion
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = 'rgba(255,255,255,1.0)';
+      ctx.fillRect(w*0.49, 0, w*0.02, h);
+      ctx.globalAlpha = 1.0;
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = true;
+      return tex;
+    }
+
+    function makeSnowFlakeTexture(w, h) {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+
+      ctx.clearRect(0,0,w,h);
+
+      const g = ctx.createRadialGradient(w*0.5, h*0.5, 0, w*0.5, h*0.5, w*0.48);
+      g.addColorStop(0.0, 'rgba(255,255,255,0.9)');
+      g.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+      g.addColorStop(1.0, 'rgba(255,255,255,0.0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(w*0.5, h*0.5, w*0.48, 0, Math.PI*2);
+      ctx.fill();
+
+      // subtle crystal points
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = 'rgba(255,255,255,1.0)';
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 6; i++) {
+        const a = (i/6) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.moveTo(w*0.5, h*0.5);
+        ctx.lineTo(w*0.5 + Math.cos(a)*w*0.28, h*0.5 + Math.sin(a)*h*0.28);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = true;
+      return tex;
+    }
+
+    function updateSnowFX(dt) {
+      if (!snowNear || !snowFar) return;
+      if (!sled) return;
+
+      const center = sled.position;
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(sled.quaternion).normalize();
+      const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), forward).normalize();
+      const up = new THREE.Vector3(0,1,0);
+
+      // speed-driven streaks: move backwards relative to forward direction
+      const speed = state.velocity || 0;
+      const nearSpeed = VISUAL.snow.nearBaseSpeed + speed * VISUAL.snow.nearSpeedFactor;
+
+      const nb = VISUAL.snow.nearBox;
+      const halfW = nb.w * 0.5;
+      const halfH = nb.h * 0.5;
+      const halfD = nb.d * 0.5;
+
+      // We keep particles in a box aligned with forward/right around the sled.
+      // Move each particle toward the sled (backwards along forward) + slight downward.
+      const dn = VISUAL.snow.nearDown;
+
+      for (let i = 0; i < VISUAL.snow.nearCount; i++) {
+        const o = i * 3;
+
+        // local coords (right/up/forward basis around sled)
+        let lx = snowNearPos[o+0];
+        let ly = snowNearPos[o+1];
+        let lz = snowNearPos[o+2];
+
+        // lz positive = ahead; move toward negative
+        lz -= nearSpeed * dt;
+        ly -= dn * dt;
+
+        // respawn if behind or below
+        if (lz < -halfD || ly < -halfH) {
+          lx = (Math.random() - 0.5) * nb.w;
+          ly = (Math.random() * nb.h) - (nb.h * 0.15);
+          lz = halfD + Math.random() * (nb.d * 0.9); // spawn ahead
+        } else {
+          // keep within lateral bounds with gentle jitter
+          if (lx < -halfW) lx = -halfW + Math.random() * 0.4;
+          if (lx >  halfW) lx =  halfW - Math.random() * 0.4;
+        }
+
+        snowNearPos[o+0] = lx;
+        snowNearPos[o+1] = ly;
+        snowNearPos[o+2] = lz;
+      }
+
+      // Convert local->world in a single pass (write into attribute array by overwriting same buffer)
+      // We store local in snowNearPos itself, so we need a temp for world write.
+      // To avoid allocations: write world into the attribute's array directly (same array),
+      // but that would destroy local. Instead we keep local in snowNearPos and write to attribute
+      // via a separate scratch? That’s extra memory.
+      //
+      // Better approach: store world positions directly and respawn ahead in world using basis.
+      // We’ll do that for far snow, but for near streaks we want box alignment.
+      //
+      // So: compute world positions in-place but also keep local by reusing the attribute array
+      // (same array) as world, and compute local respawn from inverse basis each frame is expensive.
+      //
+      // Compromise: keep local array (snowNearPos) and write world into attribute.array (same reference)
+      // by setting attribute to a DIFFERENT buffer would cost more.
+      //
+      // Solution: Use the attribute array as world positions and treat it as local each frame
+      // in the same basis by re-centering to sled and re-projecting is heavy.
+      //
+      // Practical cheap solution: store near as local but *also* keep a small world buffer.
+      // (1200*3 floats ~ 14KB) — totally fine on Quest.
+      if (!updateSnowFX._nearWorld) updateSnowFX._nearWorld = new Float32Array(VISUAL.snow.nearCount * 3);
+      const nearWorld = updateSnowFX._nearWorld;
+
+      for (let i = 0; i < VISUAL.snow.nearCount; i++) {
+        const o = i * 3;
+        const lx = snowNearPos[o+0];
+        const ly = snowNearPos[o+1];
+        const lz = snowNearPos[o+2];
+
+        // world = center + right*lx + up*ly + forward*lz
+        nearWorld[o+0] = center.x + right.x * lx + up.x * ly + forward.x * lz;
+        nearWorld[o+1] = center.y + right.y * lx + up.y * ly + forward.y * lz;
+        nearWorld[o+2] = center.z + right.z * lx + up.z * ly + forward.z * lz;
+      }
+
+      // write to GPU
+      const nearAttr = snowNearGeo.attributes.position;
+      nearAttr.array.set(nearWorld);
+      nearAttr.needsUpdate = true;
+
+      // Far snow: store directly in world around sled (gentle drift)
+      const fb = VISUAL.snow.farBox;
+      const fw = fb.w * 0.5;
+      const fh = fb.h * 0.5;
+      const fd = fb.d * 0.5;
+
+      const farDown = VISUAL.snow.farDown;
+      const wind = VISUAL.snow.farWind;
+
+      for (let i = 0; i < VISUAL.snow.farCount; i++) {
+        const o = i * 3;
+        let x = snowFarPos[o+0];
+        let y = snowFarPos[o+1];
+        let z = snowFarPos[o+2];
+
+        // drift in world (but relative to sled center)
+        y -= farDown * dt;
+        x += wind * dt * 0.35;
+        z += wind * dt * 0.15;
+
+        // keep the cloud centered on sled by periodically wrapping bounds
+        // Here x,y,z are local offsets from center, and we write world from them directly.
+        if (y < -fh) {
+          y = fh + Math.random() * (fh * 0.4);
+          x = (Math.random() - 0.5) * fb.w;
+          z = (Math.random() - 0.5) * fb.d;
+        }
+        if (x < -fw) x += fb.w;
+        if (x >  fw) x -= fb.w;
+        if (z < -fd) z += fb.d;
+        if (z >  fd) z -= fb.d;
+
+        snowFarPos[o+0] = x;
+        snowFarPos[o+1] = y;
+        snowFarPos[o+2] = z;
+      }
+
+      if (!updateSnowFX._farWorld) updateSnowFX._farWorld = new Float32Array(VISUAL.snow.farCount * 3);
+      const farWorld = updateSnowFX._farWorld;
+
+      for (let i = 0; i < VISUAL.snow.farCount; i++) {
+        const o = i * 3;
+        farWorld[o+0] = center.x + snowFarPos[o+0];
+        farWorld[o+1] = center.y + snowFarPos[o+1] + 10.0; // keep above a bit
+        farWorld[o+2] = center.z + snowFarPos[o+2];
+      }
+
+      const farAttr = snowFarGeo.attributes.position;
+      farAttr.array.set(farWorld);
+      farAttr.needsUpdate = true;
+    }
+
+    // ----------------------------
     // PHYSICS + LOOP (UNCHANGED)
     // ----------------------------
     function startRide() {
@@ -2299,6 +2862,9 @@
         document.getElementById('val-speed').innerText = (state.velocity * 3.6).toFixed(0) + " km/h";
         document.getElementById('val-alt').innerText = sled.position.y.toFixed(0) + " m";
       }
+
+      // Snow update (cheap) — even when not active, it sits gently around sled at start
+      if (VISUAL.snow.enabled) updateSnowFX(dt);
 
       updateCamera();
       renderer.render(scene, camera);
